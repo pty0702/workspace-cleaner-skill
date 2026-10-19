@@ -1,183 +1,204 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""按类别清理工作区垃圾，支持演练、分类选择、自动备份。
-
-用法：
-    python clean.py --dry-run --all                  # 演练，只打印不删
-    python clean.py --all                            # 删「可删」三类
-    python clean.py --reverse --scripts              # 只删逆向产物和一次性脚本
-    python clean.py --all --backup                   # 删前把「需确认」项打包到工作区外
-    python clean.py --all --backup --confirm         # 连「需确认」的一起删（危险，必须加 --confirm）
-
-类别参数：
-    --reverse   逆向/抓取产物（_probe、samples、js、*.html 样本…）
-    --cache     构建缓存（__pycache__、node_modules、dist…）
-    --logs      运行日志（logs/、*.log）
-    --scripts   一次性脚本（probe_*、compare_*、_*.py…）
-    --all       以上全部
-    --confirm   额外处理「需确认」项（数据库、配置、凭证）——必须显式加
-"""
+"""默认演练；真正删除必须 --apply，需确认项必须逐项 --include --confirm。"""
+import argparse
 import os
 import shutil
 import sys
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import scan as scanner  # noqa: E402
+import scan as scanner
 
+def _no_links(path, allow_missing=False):
+    if any(scanner.is_device(part) for part in Path(path).parts):
+        raise ValueError("路径含 Windows 保留设备名：" + str(path))
+    absolute = Path(os.path.abspath(path))
+    for part in list(reversed(absolute.parents)) + [absolute]:
+        try:
+            info = os.lstat(str(part))
+        except FileNotFoundError:
+            if allow_missing:
+                continue
+            raise
+        if scanner.is_link(info):
+            raise ValueError("路径含链接或目录联接：" + str(part))
+    return absolute
 
-def human(n):
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return "%.1f %s" % (n, unit)
-        n /= 1024.0
+def safe_target(root, path):
+    """删除和备份共用边界检查；根目录、Git 元数据和密钥不可选中。"""
+    root = _no_links(root).resolve(strict=True)
+    target = _no_links(path).resolve(strict=True)
+    if root == root.parent or root.name.lower() in {".git", "keys"}:
+        raise ValueError("不能以磁盘根、Git 元数据或密钥目录为清理根")
+    try:
+        relative = target.relative_to(root)
+    except ValueError:
+        raise ValueError("目标越出清理根目录：" + str(target))
+    if not relative.parts:
+        raise ValueError("不能删除清理根目录本身")
+    if any(part.lower() in {".git", "keys"} for part in relative.parts) or scanner.match_any(target.name, scanner.PRIVATE_FILES):
+        raise ValueError("目标是受保护资产：" + str(target))
+    return target
 
+def check_current(root, item):
+    path = safe_target(root, item["path"])
+    if item["blocked"] or item["category"] == "keep":
+        raise ValueError("条目不可删除：" + str(path))
+    current = scanner.snapshot(path)
+    if current["blocked"] or current["protected"] or current["errors"]:
+        raise ValueError("目标含受保护资产、链接或读取错误：" + str(path))
+    if current["signature"] != item["signature"]:
+        raise ValueError("目标在扫描后发生变化，请重新扫描确认：" + str(path))
+    return path
 
-def backup_items(root, items):
-    """把要删的项打包到工作区外的 zip，返回备份路径。"""
+def _backup_paths(root, path):
+    path = safe_target(root, path)
+    if not path.is_dir():
+        yield path
+        return
+    def fail(exc):
+        raise exc
+    for current, dirs, files in os.walk(str(path), followlinks=False, onerror=fail):
+        yield safe_target(root, current)
+        for name in dirs + files:
+            safe_target(root, os.path.join(current, name))
+        for name in files:
+            yield safe_target(root, os.path.join(current, name))
+
+def backup_items(root, items, backup_dir=None):
+    """所有成员成功写入、CRC 校验及状态复核后，才发布完整备份。"""
     if not items:
         return None
-    parent = os.path.dirname(os.path.abspath(root))
-    name = os.path.basename(os.path.abspath(root)) or "workspace"
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_path = os.path.join(parent, "_backup_%s_%s.zip" % (name, stamp))
-
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for it in items:
-            path = it["path"]
-            if it["dir"]:
-                for cur, dirs, files in os.walk(path):
-                    dirs[:] = [d for d in dirs if d != ".git"]
-                    for f in files:
-                        full = os.path.join(cur, f)
-                        try:
-                            zf.write(full, os.path.relpath(full, root))
-                        except OSError:
-                            pass
-            else:
-                try:
-                    zf.write(path, os.path.relpath(path, root))
-                except OSError:
-                    pass
-    return zip_path
-
-
-def remove_item(it):
-    path = it["path"]
+    root = Path(root).resolve(strict=True)
+    backup_dir = Path(backup_dir).absolute() if backup_dir else root.parent / "_workspace-cleaner-backups"
+    _no_links(backup_dir, allow_missing=True)
+    resolved = backup_dir.resolve()
     try:
-        if it["dir"]:
-            shutil.rmtree(path, ignore_errors=False)
-        else:
-            os.remove(path)
-        return True, ""
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
+        resolved.relative_to(root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("备份目录必须位于清理根目录外")
+    for item in items:
+        check_current(root, item)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    _no_links(backup_dir)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_path = backup_dir / ("%s-%s-%s.zip" % (root.name, stamp, uuid4().hex[:8]))
+    partial = archive_path.with_suffix(".zip.partial")
+    expected = set()
+    with zipfile.ZipFile(str(partial), "x", zipfile.ZIP_DEFLATED) as archive:
+        for item in items:
+            for path in _backup_paths(root, item["path"]):
+                name = path.relative_to(root).as_posix()
+                if path.is_dir():
+                    name += "/"
+                archive.write(str(path), name)
+                expected.add(name)
+    with zipfile.ZipFile(str(partial), "r") as archive:
+        if set(archive.namelist()) != expected or archive.testzip() is not None:
+            raise ValueError("备份校验失败，禁止删除：" + str(partial))
+    for item in items:
+        check_current(root, item)
+    os.replace(str(partial), str(archive_path))
+    return archive_path
 
+def remove_item(item, root):
+    path = check_current(root, item)
+    if path.is_dir():
+        shutil.rmtree(str(path))
+    else:
+        path.unlink()
 
-def main():
-    root = None
-    for a in sys.argv[1:]:
-        if not a.startswith("--"):
-            root = a
-            break
-    root = root or "."
+def _select(data, args):
+    kinds = {name for name in ("cache", "logs", "reverse", "scripts") if getattr(args, name)}
+    selected = [item for item in data["deletable"] if args.all or item["kind"] in kinds]
+    lookup = {os.path.normcase(os.path.abspath(item["path"])): item
+              for bucket in scanner.BUCKETS for item in data[bucket]}
+    for relative in args.include:
+        if os.path.isabs(relative):
+            raise ValueError("--include 必须使用相对路径：" + relative)
+        target = safe_target(data["root"], os.path.join(data["root"], relative))
+        item = lookup.get(os.path.normcase(str(target)))
+        if item is None:
+            scoped = scanner.classify(data["root"], targets=[target])
+            if scoped["errors"] or scoped["skipped"]:
+                raise ValueError("选中条目不能完整扫描：" + relative)
+            scoped_items = [entry for bucket in scanner.BUCKETS for entry in scoped[bucket]]
+            item = next((entry for entry in scoped_items if entry["path"] == str(target)), None)
+            if item is None:
+                raise ValueError("此目录不能整体选中，请逐项指定其中的候选或需确认项：" + relative)
+        if item["category"] == "keep" or item["blocked"]:
+            raise ValueError("不能选择保留项：" + relative)
+        if item["category"] == "confirm" and not args.confirm:
+            raise ValueError("需确认项还须显式 --confirm：" + relative)
+        selected.append(item)
+    unique = {os.path.normcase(item["path"]): item for item in selected}
+    selected = sorted(unique.values(), key=lambda item: item["path"])
+    paths = set(unique)
+    for item in selected:
+        parent = Path(item["path"]).parent
+        while parent != parent.parent:
+            if os.path.normcase(str(parent)) in paths:
+                raise ValueError("清理条目存在父子重叠")
+            parent = parent.parent
+    return selected
 
-    if not os.path.isdir(root):
-        print("目录不存在: %s" % root)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("root", nargs="?", default=".", help="单个项目目录")
+    for name, help_text in (("all", "全部可清理候选，不包含需确认项"),
+                            ("cache", "缓存候选"), ("logs", "日志候选"),
+                            ("reverse", "逆向类型候选；歧义项仍需逐项指定"),
+                            ("scripts", "脚本类型候选；歧义项仍需逐项指定")):
+        parser.add_argument("--" + name, action="store_true", help=help_text)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true", help="执行实际删除")
+    mode.add_argument("--dry-run", action="store_true", help="只演练（默认）")
+    parser.add_argument("--include", action="append", default=[], metavar="相对路径", help="从扫描清单逐项选择，可重复")
+    parser.add_argument("--confirm", action="store_true", help="仅确认 --include 明确指定的需确认项")
+    parser.add_argument("--backup", action="store_true", help="删除前备份全部选中项；需确认项始终强制备份")
+    parser.add_argument("--backup-dir", help="备份目录，必须在项目外")
+    args = parser.parse_args(argv)
+    if args.confirm and not args.include:
+        parser.error("--confirm 不能批量放行，必须同时逐项 --include")
+    if not (args.all or args.cache or args.logs or args.reverse or args.scripts or args.include):
+        parser.error("请使用 --all、分类参数或逐项 --include")
+    try:
+        root = _no_links(args.root).resolve(strict=True)
+        if root == root.parent or root.name.lower() in {".git", "keys"}:
+            raise ValueError("不能清理磁盘根目录、Git 元数据或密钥目录")
+        data = scanner.classify(root)
+        selected = _select(data, args)
+        print("目录：%s；模式：%s；选中 %d 项，%s" % (
+            root, "实际删除" if args.apply else "演练", len(selected),
+            scanner.human(sum(item["size"] for item in selected))))
+        for item in selected:
+            print("  %s  %s  %s" % (item["category"], os.path.relpath(item["path"], root), item["reason"]))
+        if data["errors"]:
+            raise ValueError("扫描存在读取错误，本次禁止删除；请先排除问题")
+        if not args.apply:
+            print("演练完成，未删除文件。实际执行须显式加 --apply。")
+            return 0
+        for item in selected:
+            check_current(root, item)
+        needs_backup = selected if args.backup else [item for item in selected if item["category"] == "confirm"]
+        archive = backup_items(root, needs_backup, args.backup_dir)
+        if archive:
+            print("完整备份已校验：" + str(archive))
+        for item in selected:
+            check_current(root, item)
+        for item in selected:
+            remove_item(item, root)
+            print("已删除：" + item["path"])
+        print("完成：删除 %d 项。请检查项目运行状态及 git status。" % len(selected))
+        return 0
+    except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as exc:
+        print("已停止：" + str(exc), file=sys.stderr)
         return 2
-
-    dry = "--dry-run" in sys.argv
-    do_backup = "--backup" in sys.argv
-    with_confirm = "--confirm" in sys.argv
-
-    want = set()
-    if "--all" in sys.argv:
-        want |= {"reverse", "cache", "logs", "scripts"}
-    if "--reverse" in sys.argv:
-        want.add("reverse")
-    if "--cache" in sys.argv:
-        want.add("cache")
-    if "--logs" in sys.argv:
-        want.add("logs")
-    if "--scripts" in sys.argv:
-        want.add("scripts")
-
-    if not want and not with_confirm:
-        print(__doc__)
-        return 1
-
-    data = scanner.classify(root)
-
-    # 按 reason 把 deletable 再细分，方便按 --reverse 之类筛选
-    def pick():
-        chosen = []
-        for it in data["deletable"]:
-            r = it["reason"]
-            if r == "逆向/抓取产物" and "reverse" in want:
-                chosen.append(it)
-            elif r == "构建缓存" and "cache" in want:
-                chosen.append(it)
-            elif r == "运行日志" and "logs" in want:
-                chosen.append(it)
-            elif r in ("一次性脚本", "抓取样本") and "scripts" in want:
-                chosen.append(it)
-        return chosen
-
-    targets = pick()
-    confirm_targets = data["confirm"] if with_confirm else []
-
-    total = sum(i["size"] for i in targets + confirm_targets)
-    print("=" * 78)
-    print("目标目录: %s" % os.path.abspath(root))
-    print("模式    : %s" % ("演练（不会真删）" if dry else "真删"))
-    print("范围    : %s%s" % (", ".join(sorted(want)) or "（无）",
-                              "  + 需确认项" if with_confirm else ""))
-    print("待处理  : %d 项 / %s" % (len(targets + confirm_targets), human(total)))
-    print("=" * 78)
-
-    for it in targets + confirm_targets:
-        tag = "⚠️ " if it in confirm_targets else "  "
-        print("%s%-46s %-8s %s" % (tag, (it["name"] + ("/" if it["dir"] else ""))[:46],
-                                   human(it["size"]), it["reason"]))
-
-    if dry:
-        print("\n演练结束。去掉 --dry-run 才会真删。")
-        return 0
-
-    if not targets and not confirm_targets:
-        print("\n没有需要处理的东西。")
-        return 0
-
-    # 备份（需确认项）
-    if do_backup and confirm_targets:
-        zp = backup_items(root, confirm_targets)
-        if zp:
-            print("\n已备份到: %s（%s）" % (zp, human(os.path.getsize(zp))))
-
-    # 真删
-    ok = fail = 0
-    freed = 0
-    print()
-    for it in targets + confirm_targets:
-        good, err = remove_item(it)
-        if good:
-            ok += 1
-            freed += it["size"]
-            print("  ✅ 删除 %s" % it["name"])
-        else:
-            fail += 1
-            print("  ❌ 失败 %s -> %s" % (it["name"], err[:80]))
-
-    print("\n完成：成功 %d，失败 %d，释放 %s" % (ok, fail, human(freed)))
-    if fail:
-        print("失败的通常是「进程占用句柄」（Windows）或权限不足，关掉相关程序后重试。")
-    print("\n下一步：")
-    print("  1) 校验：python -m compileall -q <包名> / pytest / npm run build")
-    print("  2) git status --short 看删了什么")
-    print("  3) git add -A && git commit -m \"清理工作区垃圾\"")
-    return 0 if fail == 0 else 1
-
 
 if __name__ == "__main__":
     sys.exit(main())

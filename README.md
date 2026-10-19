@@ -1,92 +1,69 @@
 # workspace-cleaner-skill
 
-清理项目工作区垃圾的 **Agent Skill**：按规则识别逆向产物、构建缓存、临时脚本、调试数据，安全删除并保留源码/文档/配置/凭证。
+用 Python 标准库递归扫描项目垃圾，支持逐项目批量报告；明确授权后再删除。兼容 Python 3.8+、Windows 和 Linux。
 
-## 它解决什么
+## 安装到 Codex
 
-项目目录几百 MB，其实代码只有几十 KB——剩下全是抓取的 HTML、下载的 chunk、调试脚本、日志、缓存。
+将 SKILL.md、scripts/、references/ 放到 ~/.codex/skills/workspace-cleaner-skill/。其他支持标准 SKILL.md 的 Agent 可按其技能目录约定安装。
 
-直接删怕删错，不删又占地方、git 里还混一堆垃圾。
+使用时直接说：
 
-这个 skill 给出一套**可执行的清理流程**：
+> 用 workspace-cleaner-skill 扫描项目垃圾
 
-1. **扫描** → 输出「可删 / 需确认 / 必留」三张清单 + 体积统计
-2. **确认** → 数据库、配置、凭证类逐条问人（不擅自删）
-3. **备份** → 决定删的不可逆项先打包到工作区外
-4. **删除** → 按类别批量删，可先 `--dry-run` 演练
-5. **校验** → 编译/测试/`git status`，确认代码没坏
-6. **提交** → 删除也要留痕
+## 扫描与报告
 
-## 核心判据
+~~~bash
+# 单项目，默认递归扫描
+python -B scripts/scan.py D:\projects\my-project
 
-> **「重新生成的成本 ≈ 0 吗？」**
->
-> - 是（缓存、抓取样本、日志、一次性脚本）→ 直接删
-> - 不是（数据库、配置文件、私钥）→ **需确认**或**必留**
+# 逐项目扫描父目录下的每个一级文件夹
+python -B scripts/scan.py D:\projects --batch --output report.html
 
-## 安装
+# JSON 完整清单；--top 仅影响终端显示，不截断报告
+python -B scripts/scan.py --top 20 D:\projects\my-project --json --output report.json
+~~~
 
-```bash
-mkdir -p ~/.agents/skills
-cp -r . ~/.agents/skills/workspace-cleaner-skill
-```
+输出三类清单：可清理候选、需确认、保留。HTML 报告包含逐项目汇总和可展开明细；JSON 还包含错误、跳过入口及元数据指纹。
 
-Windows：
+按文件逻辑大小统计，不跟随符号链接或 Windows 目录联接，排除各级 .git。读取失败会记录并返回非零状态，不能把失败项当成零字节垃圾；批量扫描会继续报告其他项目。硬链接、压缩、稀疏文件及进程占用可能影响实际释放空间。
 
-```powershell
-Copy-Item -Recurse . "$env:USERPROFILE\.agents\skills\workspace-cleaner-skill"
-```
+Windows 的 nul、con、COM1 等保留设备名跳过并报告，不作为普通文件访问或删除。
 
-装好后，直接跟模型说：
+## 清理
 
-> 用 workspace-cleaner-skill 清一下这个项目的垃圾
+~~~bash
+# 默认仅演练
+python -B scripts/clean.py D:\projects\my-project --all
 
-## 手动使用脚本
+# 显式授权后删除缓存和日志候选
+python -B scripts/clean.py D:\projects\my-project --cache --logs --apply
 
-脚本是纯标准库，无第三方依赖，Windows / Linux 都能跑。
+# 仅选中用户逐项确认的条目，自动先备份并校验
+python -B scripts/clean.py D:\projects\my-project --include dist --confirm --apply
 
-```bash
-# 1. 扫描（先看清单，别急着删）
-python scripts/scan.py D:\projects\my-project
+# --include 可重复；--backup 额外备份普通候选
+python -B scripts/clean.py D:\projects\my-project --include debug.log --backup --apply
+~~~
 
-# 2. 演练（只打印，不删）
-python scripts/clean.py D:\projects\my-project --dry-run --all
+相较旧版，去掉 --dry-run 不再触发删除：必须显式 --apply。--confirm 不再放行全部需确认项，必须同时逐项 --include。--all 仍只选普通候选。--reverse、--scripts 保留类别接口，但样本和脚本通常需要逐项确认。
 
-# 3. 真删（自动把「需确认」项备份到工作区外）
-python scripts/clean.py D:\projects\my-project --all --backup
+--include 可精确到折叠目录内的单个文件，例如 dist/old-report.html；此时按项目原上下文重新分类该文件，不会连同整个 dist 删除。
 
-# 4. 只删某几类
-python scripts/clean.py . --cache --logs
-python scripts/clean.py . --reverse --scripts
+备份默认写到项目父目录的 _workspace-cleaner-backups，或使用 --backup-dir 指定项目外目录。只有完整写入、CRC 校验及源文件状态复核均成功，才发布 .zip 并继续删除；失败留下的 .partial 不视作完整备份。删除前再次检查路径边界、保护项和文件变化。
 
-# 5. 连数据库/配置一起删（危险，必须显式加 --confirm）
-python scripts/clean.py . --all --confirm --backup
-```
+不会自动删除 Git 元数据、keys、已识别的私钥或链接。含这些资产、链接或读取错误的候选目录禁止整体删除。数据库、配置、构建交付产物、虚拟环境、浏览器数据和有歧义的源码/样本默认保留待确认。
 
-## 文件分类规则（摘要）
+完整分类见 [references/classify-rules.md](references/classify-rules.md)。
 
-| 类别 | 特征 | 处理 |
-|---|---|---|
-| 逆向/抓取产物 | `_probe/` `samples/` `js/` `*.html` 样本 `*_dump.json` | 删 |
-| 构建缓存 | `__pycache__/` `node_modules/` `dist/` `*.pyc` | 删 |
-| 运行产物 | `logs/` `*.log` `tmp/` | 删 |
-| 一次性脚本 | `probe_*` `compare_*` `peek_*` `_*.py` `*.bak` | 删 |
-| ⚠️ 需确认 | `*.db` `config.json` `.env` `*credentials*` | 先问人 |
-| 🔒 必留 | `.git/` `keys/` `README*` `deploy/` `*.service` 源码 | 永不动 |
+## 检查
 
-完整规则和易误判边界见 [references/classify-rules.md](references/classify-rules.md)。
+~~~bash
+python -B scripts/test_workflow.py
+~~~
 
-## 目录结构
+仅在仓库 .git/test-workflow 内创建隔离样本，覆盖递归统计、默认演练、显式选择、备份失败、文件变化和路径越界；Windows 还检查目录联接。测试不操作真实项目。可通过 WORKSPACE_CLEANER_TEST_DIR 指定隔离位置。
 
-```
-workspace-cleaner-skill/
-├─ SKILL.md                    流程手册（分类规则 + 六步操作 + 9 个坑）
-├─ scripts/
-│  ├─ scan.py                  扫描分类与体积
-│  └─ clean.py                 执行清理（dry-run / backup / 分类选择）
-└─ references/
-   └─ classify-rules.md        分类规则表 + 边界判断
-```
+删除操作无法提供整个目录树的事务回滚；遇到变化或错误会停止剩余操作。实际清理后检查项目及 Git 状态，只提交本次改动。
 
 ## 许可
 
